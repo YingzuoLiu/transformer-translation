@@ -1,0 +1,90 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch 相关
+*.pt
+*.pth
+*.onnx
+
+# 训练好的模型
+models/*.pt
+models/*.pth
+models/*.bin
+
+# 数据集和缓存
+data/
+.data/
+.vector_cache/
+.cache/
+
+# 日志和输出
+logs/
+*.log
+*.csv
+*.json
+wandb/
+
+# Jupyter相关
+.ipynb_checkpoints
+*.ipynb
+
+# Docker相关
+.docker/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+.spyderproject
+.spyproject
+.ropeproject
+
+# 结果和图表
+results/attention_maps/
+results/bleu_scores/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 异常：保留空目录结构
+!data/.gitkeep
+!models/.gitkeep
+!results/.gitkeep
+!results/attention_maps/.gitkeep
+!results/bleu_scores/.gitkeep
