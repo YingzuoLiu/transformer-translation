@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   transformer:
     build:
@@ -23,6 +21,15 @@ services:
               capabilities: [gpu]
     command: bash -c "jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='transformer'"
 
+  download:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+    command: python download_multi30k.py
+
   train:
     build:
       context: .
@@ -40,7 +47,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: python src/train.py --epochs 10 --batch_size 128 --save_dir models/
+    command: python src/train_local.py --epochs 10 --batch_size 128 --save_dir models/
 
   evaluate:
     build:
@@ -59,4 +66,4 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: python src/evaluate.py --model_path models/transformer-model.pt --beam_sizes "1 3 5 10" --test_data Multi30k
+    command: python src/evaluate_local.py --model_path models/transformer-model.pt --beam_sizes "1 3 5 10"

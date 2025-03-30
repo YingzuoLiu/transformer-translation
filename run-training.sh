@@ -1,7 +1,7 @@
 mkdir -p logs
 
-# 评估模型
-echo "开始评估模型..."
-docker-compose run --rm evaluate | tee logs/evaluation.log
+# 训练模型
+echo "开始训练模型..."
+docker-compose run --rm train | tee logs/training.log
 
-echo "评估完成！"
+echo "训练完成！"

@@ -3,13 +3,11 @@ import torch.nn as nn
 import spacy
 import argparse
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import time
 import os
 import numpy as np
-from torchtext.datasets import Multi30k
-from torchtext.vocab import build_vocab_from_iterator
-from torchtext.data.utils import get_tokenizer
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sacrebleu.metrics import BLEU
 from tqdm import tqdm
@@ -22,13 +20,94 @@ TRG_LANGUAGE = 'en'
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 SPECIAL_SYMBOLS = ['<unk>', '<pad>', '<bos>', '<eos>']
 
-def sequential_transforms(*transforms):
-    """将多个变换函数组合在一起"""
-    def func(txt_input):
-        for transform in transforms:
-            txt_input = transform(txt_input)
-        return txt_input
-    return func
+class Vocab:
+    """简单的词汇表类"""
+    def __init__(self, specials=None):
+        self.stoi = {}  # string to index
+        self.itos = []  # index to string
+        self.freqs = {}  # token frequencies
+        
+        # 添加特殊标记
+        if specials:
+            for i, token in enumerate(specials):
+                self.stoi[token] = i
+                self.itos.append(token)
+    
+    def add_token(self, token):
+        """添加标记到词汇表"""
+        if token not in self.stoi:
+            self.stoi[token] = len(self.itos)
+            self.itos.append(token)
+            self.freqs[token] = 1
+        else:
+            self.freqs[token] += 1
+    
+    def __getitem__(self, token):
+        """获取标记的索引"""
+        return self.stoi.get(token, self.stoi.get('<unk>', 0))
+    
+    def __len__(self):
+        """词汇表大小"""
+        return len(self.itos)
+    
+    def get_itos(self):
+        """获取索引到字符串的映射"""
+        return self.itos
+
+class TranslationDataset(Dataset):
+    """翻译数据集"""
+    def __init__(self, src_file, trg_file):
+        self.src_sentences = self.read_file(src_file)
+        self.trg_sentences = self.read_file(trg_file)
+        
+        assert len(self.src_sentences) == len(self.trg_sentences), \
+            "源语言和目标语言文件行数不匹配"
+    
+    def read_file(self, file_path):
+        """读取文本文件"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return [line.strip() for line in f]
+    
+    def __len__(self):
+        return len(self.src_sentences)
+    
+    def __getitem__(self, idx):
+        src = self.src_sentences[idx]
+        trg = self.trg_sentences[idx]
+        
+        # 对于已经标记化的文件，直接分割
+        src_tokens = src.split()
+        trg_tokens = trg.split()
+        
+        return src_tokens, trg_tokens
+
+def build_vocab_from_dataset(dataset, index=0, min_freq=2):
+    """从数据集构建词汇表
+    
+    参数:
+        dataset: 数据集对象
+        index: 0表示源语言，1表示目标语言
+        min_freq: 最小频率阈值
+    """
+    vocab = Vocab(SPECIAL_SYMBOLS)
+    
+    # 构建词频字典
+    token_freq = {}
+    
+    for i in range(len(dataset)):
+        tokens = dataset[i][index]  # 获取对应语言的tokens
+        for token in tokens:
+            if token not in token_freq:
+                token_freq[token] = 1
+            else:
+                token_freq[token] += 1
+    
+    # 添加频率大于min_freq的标记
+    for token, freq in token_freq.items():
+        if freq >= min_freq:
+            vocab.add_token(token)
+    
+    return vocab
 
 def tensor_transform(token_ids):
     """添加BOS/EOS并创建tensor"""
@@ -36,89 +115,12 @@ def tensor_transform(token_ids):
                       torch.tensor(token_ids), 
                       torch.tensor([EOS_IDX])))
 
-def load_tokenizers():
-    """加载分词器"""
-    try:
-        spacy_de = spacy.load("de_core_news_sm")
-        spacy_en = spacy.load("en_core_web_sm")
-    except OSError:
-        # 如果spaCy模型不存在，尝试下载
-        os.system('python -m spacy download de_core_news_sm')
-        os.system('python -m spacy download en_core_web_sm')
-        spacy_de = spacy.load("de_core_news_sm")
-        spacy_en = spacy.load("en_core_web_sm")
-    
-    # 定义德语和英语分词器
-    tokenizer_de = get_tokenizer(lambda text: [tok.text for tok in spacy_de.tokenizer(text)], language='de')
-    tokenizer_en = get_tokenizer(lambda text: [tok.text for tok in spacy_en.tokenizer(text)], language='en')
-    
-    return tokenizer_de, tokenizer_en
-
-def yield_tokens(data_iter, tokenizer, index):
-    """生成器函数，从数据迭代器中产生标记"""
-    for data_sample in data_iter:
-        yield tokenizer(data_sample[index].lower())
-
-def build_vocab(tokenizer, dataset, language):
-    """构建词汇表"""
-    # 根据语言选择索引
-    index = 0 if language == SRC_LANGUAGE else 1
-    
-    # 构建词汇表
-    vocab = build_vocab_from_iterator(
-        yield_tokens(dataset, tokenizer, index),
-        min_freq=2,
-        specials=SPECIAL_SYMBOLS,
-        special_first=True
-    )
-    
-    # 设置默认索引
-    vocab.set_default_index(UNK_IDX)
-    
-    return vocab
-
-def create_datasets(tokenizer_src, tokenizer_trg, vocab_src, vocab_trg):
-    """创建数据集处理管道"""
-    # 源语言变换
-    text_transform_src = sequential_transforms(
-        tokenizer_src,  # 分词
-        lambda x: [vocab_src[token] for token in x],  # 数字化
-        tensor_transform  # 添加BOS/EOS并转换为tensor
-    )
-    
-    # 目标语言变换
-    text_transform_trg = sequential_transforms(
-        tokenizer_trg,  # 分词
-        lambda x: [vocab_trg[token] for token in x],  # 数字化
-        tensor_transform  # 添加BOS/EOS并转换为tensor
-    )
-    
-    # 使用Multi30k数据集
-    train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'),
-                                               language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
-    
-    # 数据处理函数
-    def collate_fn(batch):
-        src_batch, trg_batch = [], []
-        for src_sample, trg_sample in batch:
-            src_batch.append(text_transform_src(src_sample))
-            trg_batch.append(text_transform_trg(trg_sample))
-            
-        # 填充序列
-        src_batch = pad_sequence(src_batch, padding_value=PAD_IDX)
-        trg_batch = pad_sequence(trg_batch, padding_value=PAD_IDX)
-        
-        return src_batch, trg_batch
-    
-    return train_iter, valid_iter, test_iter, collate_fn
-
-def translate_sentence_beam_search(sentence, tokenizer_src, vocab_src, vocab_trg, model, device, max_len=50, beam_size=5):
+def translate_sentence_beam_search(src_tokens, vocab_src, vocab_trg, model, device, max_len=50, beam_size=5):
     """
     使用束搜索翻译一个句子
     
     参数:
-        sentence: 源语言句子（字符串或token列表）
-        tokenizer_src: 源语言分词器
+        src_tokens: 源语言句子标记列表
         vocab_src: 源语言词汇表
         vocab_trg: 目标语言词汇表
         model: 训练好的模型
@@ -131,20 +133,11 @@ def translate_sentence_beam_search(sentence, tokenizer_src, vocab_src, vocab_trg
     """
     model.eval()
     
-    # 处理输入句子
-    if isinstance(sentence, str):
-        tokens = tokenizer_src(sentence.lower())
-    else:
-        tokens = [token.lower() for token in sentence]
-    
     # 数字化
-    token_ids = [vocab_src[token] for token in tokens]
+    token_ids = [vocab_src[token] for token in src_tokens]
     
-    # 添加BOS/EOS
-    token_ids = [BOS_IDX] + token_ids + [EOS_IDX]
-    
-    # 转换为张量
-    src_tensor = torch.LongTensor(token_ids).unsqueeze(0).to(device)
+    # 转换为张量，包含BOS和EOS
+    src_tensor = tensor_transform(token_ids).unsqueeze(0).to(device)
     src_mask = model.make_src_mask(src_tensor)
     
     # 获取编码器输出
@@ -240,13 +233,13 @@ def translate_sentence_beam_search(sentence, tokenizer_src, vocab_src, vocab_trg
     
     return translation, attention
 
-def display_attention(sentence, translation, attention, tokenizer_src, n_heads=8, n_rows=4, n_cols=2, save_path=None):
+def display_attention(src_tokens, translation, attention, n_heads=8, n_rows=4, n_cols=2, save_path=None):
     """
     可视化注意力权重
     
     参数:
-        sentence: 源语言句子
-        translation: 翻译后的句子
+        src_tokens: 源语言标记列表
+        translation: 翻译后的句子标记列表
         attention: 注意力权重
         n_heads: 要显示的注意力头数量
         n_rows, n_cols: 图表的行数和列数
@@ -255,13 +248,8 @@ def display_attention(sentence, translation, attention, tokenizer_src, n_heads=8
     assert n_rows * n_cols >= n_heads
     
     # 准备源语言和目标语言的标记
-    if isinstance(sentence, str):
-        src_tokens = tokenizer_src(sentence.lower())
-    else:
-        src_tokens = [token.lower() for token in sentence]
-        
-    src_tokens = ['<bos>'] + src_tokens + ['<eos>']
-    trg_tokens = ['<bos>'] + translation + ['<eos>']
+    src_tokens_with_special = ['<bos>'] + src_tokens + ['<eos>']
+    trg_tokens_with_special = ['<bos>'] + translation + ['<eos>']
     
     # 选择要显示的注意力头
     attention = attention.squeeze(0).cpu().detach().numpy()
@@ -279,12 +267,12 @@ def display_attention(sentence, translation, attention, tokenizer_src, n_heads=8
         cax = ax.matshow(_attention, cmap='viridis')
         
         # Set labels
-        ax.set_xticklabels([''] + src_tokens, rotation=90)
-        ax.set_yticklabels([''] + trg_tokens)
+        ax.set_xticklabels([''] + src_tokens_with_special, rotation=90)
+        ax.set_yticklabels([''] + trg_tokens_with_special)
         
         # 设置坐标轴刻度
-        ax.xaxis.set_major_locator(plt.ticker.MultipleLocator(1))
-        ax.yaxis.set_major_locator(plt.ticker.MultipleLocator(1))
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
         
         ax.set_title(f'Head {i+1}')
         
@@ -298,13 +286,12 @@ def display_attention(sentence, translation, attention, tokenizer_src, n_heads=8
     
     plt.show()
 
-def evaluate_beam_sizes(test_data, tokenizer_src, vocab_src, vocab_trg, model, device, beam_sizes=[1, 3, 5, 10], max_len=50, num_examples=100):
+def evaluate_beam_sizes(test_dataset, vocab_src, vocab_trg, model, device, beam_sizes=[1, 3, 5, 10], max_len=50, num_examples=100):
     """
     评估不同束宽的BLEU分数
     
     参数:
-        test_data: 测试数据迭代器
-        tokenizer_src: 源语言分词器
+        test_dataset: 测试数据集
         vocab_src: 源语言词汇表
         vocab_trg: 目标语言词汇表
         model: 训练好的模型
@@ -322,7 +309,7 @@ def evaluate_beam_sizes(test_data, tokenizer_src, vocab_src, vocab_trg, model, d
     bleu = BLEU(effective_order=True)
     
     # 准备测试数据
-    test_samples = list(test_data)[:num_examples]
+    test_samples = [test_dataset[i] for i in range(min(num_examples, len(test_dataset)))]
     
     for beam_size in beam_sizes:
         start_time = time.time()
@@ -332,15 +319,15 @@ def evaluate_beam_sizes(test_data, tokenizer_src, vocab_src, vocab_trg, model, d
         
         print(f"使用束宽 {beam_size} 计算BLEU分数...")
         
-        for src_sample, trg_sample in tqdm(test_samples):
+        for src_tokens, trg_tokens in tqdm(test_samples):
             # 翻译源句子
             translation, _ = translate_sentence_beam_search(
-                src_sample, tokenizer_src, vocab_src, vocab_trg, model, device, max_len, beam_size
+                src_tokens, vocab_src, vocab_trg, model, device, max_len, beam_size
             )
             
             # 添加到列表
             hypotheses.append(' '.join(translation))
-            references.append([' '.join(trg_sample.split())])
+            references.append([' '.join(trg_tokens)])
         
         # 计算BLEU分数
         bleu_score = bleu.corpus_score(hypotheses, references).score
@@ -441,6 +428,7 @@ def main():
     parser.add_argument('--num_examples', type=int, default=100, help='评估的样例数量')
     parser.add_argument('--visualize', action='store_true', help='可视化翻译和注意力')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='设备')
+    parser.add_argument('--data_dir', type=str, default='data/multi30k', help='数据目录')
     
     args = parser.parse_args()
     
@@ -451,22 +439,27 @@ def main():
     device = torch.device(args.device)
     print(f"使用设备: {device}")
     
-    # 加载分词器和构建词汇表
-    print("加载分词器...")
-    tokenizer_src, tokenizer_trg = load_tokenizers()
+    # 文件路径
+    train_src_file = os.path.join(args.data_dir, 'train.de-en.de')
+    train_trg_file = os.path.join(args.data_dir, 'train.de-en.en')
+    test_src_file = os.path.join(args.data_dir, 'test.de-en.de')
+    test_trg_file = os.path.join(args.data_dir, 'test.de-en.en')
     
-    # 加载数据集
-    print("加载数据集...")
-    train_iter, valid_iter, test_iter, _ = Multi30k(split=('train', 'valid', 'test'),
-                                                  language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
+    # 创建训练数据集（用于构建词汇表）
+    print("加载训练数据集...")
+    train_dataset = TranslationDataset(train_src_file, train_trg_file)
     
     # 构建词汇表
     print("构建词汇表...")
-    vocab_src = build_vocab(tokenizer_src, train_iter, SRC_LANGUAGE)
-    vocab_trg = build_vocab(tokenizer_trg, train_iter, TRG_LANGUAGE)
+    vocab_src = build_vocab_from_dataset(train_dataset, index=0, min_freq=2)
+    vocab_trg = build_vocab_from_dataset(train_dataset, index=1, min_freq=2)
     
     print(f"源语言词汇表大小: {len(vocab_src)}")
     print(f"目标语言词汇表大小: {len(vocab_trg)}")
+    
+    # 创建测试数据集
+    print("加载测试数据集...")
+    test_dataset = TranslationDataset(test_src_file, test_trg_file)
     
     # 加载模型
     print(f"加载模型: {args.model_path}")
@@ -475,7 +468,7 @@ def main():
     # 评估不同束宽的BLEU分数
     print("开始评估...")
     results = evaluate_beam_sizes(
-        test_iter, tokenizer_src, vocab_src, vocab_trg, model, device, 
+        test_dataset, vocab_src, vocab_trg, model, device, 
         beam_sizes=beam_sizes, 
         max_len=args.max_len, 
         num_examples=args.num_examples
@@ -487,16 +480,17 @@ def main():
     # 可视化样例翻译
     if args.visualize:
         print("可视化样例翻译...")
-        test_samples = list(test_iter)[:3]  # 取前3个样例
-        
-        for i, (src_sample, trg_sample) in enumerate(test_samples):
+        num_examples = 3  # 可视化3个例子
+        for i in range(min(num_examples, len(test_dataset))):
+            src_tokens, trg_tokens = test_dataset[i]
+            
             print(f"\n样例 {i+1}:")
-            print(f"源句: {src_sample}")
-            print(f"参考译文: {trg_sample}")
+            print(f"源句: {' '.join(src_tokens)}")
+            print(f"参考译文: {' '.join(trg_tokens)}")
             
             # 翻译
             translation, attention = translate_sentence_beam_search(
-                src_sample, tokenizer_src, vocab_src, vocab_trg, model, device, 
+                src_tokens, vocab_src, vocab_trg, model, device, 
                 max_len=args.max_len, beam_size=5
             )
             
@@ -505,7 +499,7 @@ def main():
             # 可视化注意力
             save_path = f'results/attention_maps/attention_sample{i+1}_beam5.png'
             os.makedirs('results/attention_maps', exist_ok=True)
-            display_attention(src_sample, translation, attention, tokenizer_src, 
+            display_attention(src_tokens, translation, attention, 
                             n_heads=4, n_rows=2, n_cols=2, save_path=save_path)
 
 if __name__ == "__main__":

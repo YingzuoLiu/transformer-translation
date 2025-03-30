@@ -8,10 +8,7 @@ import math
 import time
 import os
 import random
-from torchtext.datasets import Multi30k
-from torchtext.vocab import build_vocab_from_iterator
-from torchtext.data.utils import get_tokenizer
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
@@ -40,58 +37,98 @@ def count_parameters(model):
     """计算模型参数数量"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def sequential_transforms(*transforms):
-    """将多个变换函数组合在一起"""
-    def func(txt_input):
-        for transform in transforms:
-            txt_input = transform(txt_input)
-        return txt_input
-    return func
-
 def tensor_transform(token_ids):
     """添加BOS/EOS并创建tensor"""
     return torch.cat((torch.tensor([BOS_IDX]), 
                       torch.tensor(token_ids), 
                       torch.tensor([EOS_IDX])))
 
-def load_tokenizers():
-    """加载分词器"""
-    try:
-        spacy_de = spacy.load("de_core_news_sm")
-        spacy_en = spacy.load("en_core_web_sm")
-    except OSError:
-        # 如果spaCy模型不存在，尝试下载
-        os.system('python -m spacy download de_core_news_sm')
-        os.system('python -m spacy download en_core_web_sm')
-        spacy_de = spacy.load("de_core_news_sm")
-        spacy_en = spacy.load("en_core_web_sm")
+class Vocab:
+    """简单的词汇表类"""
+    def __init__(self, specials=None):
+        self.stoi = {}  # string to index
+        self.itos = []  # index to string
+        self.freqs = {}  # token frequencies
+        
+        # 添加特殊标记
+        if specials:
+            for i, token in enumerate(specials):
+                self.stoi[token] = i
+                self.itos.append(token)
     
-    # 定义德语和英语分词器
-    tokenizer_de = get_tokenizer(lambda text: [tok.text for tok in spacy_de.tokenizer(text)], language='de')
-    tokenizer_en = get_tokenizer(lambda text: [tok.text for tok in spacy_en.tokenizer(text)], language='en')
+    def add_token(self, token):
+        """添加标记到词汇表"""
+        if token not in self.stoi:
+            self.stoi[token] = len(self.itos)
+            self.itos.append(token)
+            self.freqs[token] = 1
+        else:
+            self.freqs[token] += 1
     
-    return tokenizer_de, tokenizer_en
+    def __getitem__(self, token):
+        """获取标记的索引"""
+        return self.stoi.get(token, self.stoi.get('<unk>', 0))
+    
+    def __len__(self):
+        """词汇表大小"""
+        return len(self.itos)
+    
+    def get_itos(self):
+        """获取索引到字符串的映射"""
+        return self.itos
 
-def yield_tokens(data_iter, tokenizer, index):
-    """生成器函数，从数据迭代器中产生标记"""
-    for data_sample in data_iter:
-        yield tokenizer(data_sample[index].lower())
+class TranslationDataset(Dataset):
+    """翻译数据集"""
+    def __init__(self, src_file, trg_file):
+        self.src_sentences = self.read_file(src_file)
+        self.trg_sentences = self.read_file(trg_file)
+        
+        assert len(self.src_sentences) == len(self.trg_sentences), \
+            "源语言和目标语言文件行数不匹配"
+    
+    def read_file(self, file_path):
+        """读取文本文件"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return [line.strip() for line in f]
+    
+    def __len__(self):
+        return len(self.src_sentences)
+    
+    def __getitem__(self, idx):
+        src = self.src_sentences[idx]
+        trg = self.trg_sentences[idx]
+        
+        # 对于已经标记化的文件，直接分割
+        src_tokens = src.split()
+        trg_tokens = trg.split()
+        
+        return src_tokens, trg_tokens
 
-def build_vocab(tokenizer, dataset, language):
-    """构建词汇表"""
-    # 根据语言选择索引
-    index = 0 if language == SRC_LANGUAGE else 1
+def build_vocab_from_dataset(dataset, index=0, min_freq=2):
+    """从数据集构建词汇表
     
-    # 构建词汇表
-    vocab = build_vocab_from_iterator(
-        yield_tokens(dataset, tokenizer, index),
-        min_freq=2,
-        specials=SPECIAL_SYMBOLS,
-        special_first=True
-    )
+    参数:
+        dataset: 数据集对象
+        index: 0表示源语言，1表示目标语言
+        min_freq: 最小频率阈值
+    """
+    vocab = Vocab(SPECIAL_SYMBOLS)
     
-    # 设置默认索引
-    vocab.set_default_index(UNK_IDX)
+    # 构建词频字典
+    token_freq = {}
+    
+    for i in range(len(dataset)):
+        tokens = dataset[i][index]  # 获取对应语言的tokens
+        for token in tokens:
+            if token not in token_freq:
+                token_freq[token] = 1
+            else:
+                token_freq[token] += 1
+    
+    # 添加频率大于min_freq的标记
+    for token, freq in token_freq.items():
+        if freq >= min_freq:
+            vocab.add_token(token)
     
     return vocab
 
@@ -217,6 +254,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.0005, help='学习率')
     parser.add_argument('--save_dir', type=str, default='models', help='模型保存目录')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='设备')
+    parser.add_argument('--data_dir', type=str, default='data/multi30k', help='数据目录')
     
     args = parser.parse_args()
     
@@ -230,19 +268,28 @@ def main():
     # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # 加载分词器
-    print("加载分词器...")
-    tokenizer_src, tokenizer_trg = load_tokenizers()
+    # 文件路径
+    train_src_file = os.path.join(args.data_dir, 'train.de-en.de')
+    train_trg_file = os.path.join(args.data_dir, 'train.de-en.en')
+    val_src_file = os.path.join(args.data_dir, 'val.de-en.de')
+    val_trg_file = os.path.join(args.data_dir, 'val.de-en.en')
+    test_src_file = os.path.join(args.data_dir, 'test.de-en.de')
+    test_trg_file = os.path.join(args.data_dir, 'test.de-en.en')
     
-    # 加载数据集
-    print("加载Multi30k数据集...")
-    train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), 
-                                              language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
+    # 创建数据集
+    print("加载数据集...")
+    train_dataset = TranslationDataset(train_src_file, train_trg_file)
+    val_dataset = TranslationDataset(val_src_file, val_trg_file)
+    test_dataset = TranslationDataset(test_src_file, test_trg_file)
+    
+    print(f"训练集大小: {len(train_dataset)}")
+    print(f"验证集大小: {len(val_dataset)}")
+    print(f"测试集大小: {len(test_dataset)}")
     
     # 构建词汇表
     print("构建词汇表...")
-    vocab_src = build_vocab(tokenizer_src, train_iter, SRC_LANGUAGE)
-    vocab_trg = build_vocab(tokenizer_trg, train_iter, TRG_LANGUAGE)
+    vocab_src = build_vocab_from_dataset(train_dataset, index=0, min_freq=2)
+    vocab_trg = build_vocab_from_dataset(train_dataset, index=1, min_freq=2)
     
     print(f"源语言词汇表大小: {len(vocab_src)}")
     print(f"目标语言词汇表大小: {len(vocab_trg)}")
@@ -250,13 +297,12 @@ def main():
     # 数据处理
     def collate_fn(batch):
         src_batch, trg_batch = [], []
-        for src_sample, trg_sample in batch:
-            src_tokens = tokenizer_src(src_sample.lower())
-            trg_tokens = tokenizer_trg(trg_sample.lower())
-            
+        for src_tokens, trg_tokens in batch:
+            # 数字化
             src_ids = [vocab_src[token] for token in src_tokens]
             trg_ids = [vocab_trg[token] for token in trg_tokens]
             
+            # 添加BOS/EOS
             src_tensor = tensor_transform(src_ids)
             trg_tensor = tensor_transform(trg_ids)
             
@@ -271,11 +317,11 @@ def main():
         return src_batch.transpose(0, 1), trg_batch.transpose(0, 1)
     
     # 创建数据加载器
-    train_dataloader = DataLoader(list(train_iter), batch_size=args.batch_size,
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size,
                                  shuffle=True, collate_fn=collate_fn)
-    valid_dataloader = DataLoader(list(valid_iter), batch_size=args.batch_size,
-                                 shuffle=False, collate_fn=collate_fn)
-    test_dataloader = DataLoader(list(test_iter), batch_size=args.batch_size,
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size,
+                               shuffle=False, collate_fn=collate_fn)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size,
                                 shuffle=False, collate_fn=collate_fn)
     
     # 构建模型
@@ -315,7 +361,7 @@ def main():
         start_time = time.time()
         
         train_loss = train(model, train_dataloader, optimizer, criterion, args.clip, device)
-        valid_loss = evaluate(model, valid_dataloader, criterion, device)
+        valid_loss = evaluate(model, val_dataloader, criterion, device)
         
         end_time = time.time()
         
